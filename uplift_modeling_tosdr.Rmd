@@ -1,0 +1,417 @@
+---
+title: A/BテストでないUpliftModeling
+output:
+  html_document:
+    df_print: paged
+---
+
+
+# データ準備
+
+## データ読み込み
+CMによってアプリの登録者増加施策のテストデータ
+https://drive.google.com/file/d/0Bw-J75fYQ33NV19UM3JFLTVJX2s/view
+https://github.com/iwanami-datascience/vol3/blob/master/kato%26hoshino/q_data_x.csv
+```{r}
+df <- read.csv("./input/q_data_x.csv")
+```
+
+## データ確認
+```{r}
+df$is_cv <- ifelse(df$gamedummy==1, 1, 0)
+df$is_treat <- ifelse(df$cm_dummy==1, 1, 0)
+summary(df)
+str(df)
+apply(df, 2, function(y) sum(is.na(y)))
+
+table(df$is_treat)
+table(df$is_cv)
+
+pred_vars = c("marry_dummy", "child_dummy", "area_kanto", "area_tokai", "area_keihanshin",
+              "inc", "pmoney", "TVwatch_day", "T", "F1", "F2", "F3", "M1", "M2", "M3")
+boxplot(scale(df[,pred_vars]))
+
+# install.packages('psych')
+library(psych)
+cor.plot(cor(df[,pred_vars]), numbers=T)
+```
+
+## 個別データの確認
+area_kanto 居住地が関東
+area_keihin 居住地が京浜 
+area_tokai 居住地が東海 
+area_keihanshin 居住地が京阪神 
+age 年齢 
+sex 性別（男性＝1） 
+marry_dummy 結婚の有無（既婚＝1）
+child_dummy 子供の有無（子供あり＝1） 
+job_dummy1 職業：正社員・公務員 
+job_dummy2 職業：自営業・個人事業主 
+job_dummy3 職業：派遣社員・契約社員 
+job_dummy4 職業：その他職業 
+job_dummy5 職業：パート・アルバイト 
+job_dummy6 職業：専業主婦・専業主夫 
+job_dummy7 職業：学生 
+job_dummy8 職業：無職
+inc 年間収入
+pmoney 1月あたりのお小遣い
+fam_str_dummy1 家族構成：単身
+fam_str_dummy2 家族構成：夫婦のみ
+fam_str_dummy3 家族構成：2世代同居
+fam_str_dummy4 家族構成：3世代同居
+fam_str_dummy5 家族構成：その他
+TVwatch_day 1日当たりの平均TV視聴時間
+T 13~19歳の男女
+F1 20~34歳の女性
+F2 35~49歳の女性
+F3 50歳以上の女性
+M1 20~34歳の男性
+M2 35~49歳の男性
+M3 50歳以上の男性
+
+```{r}
+head(df[,pred_vars])
+```
+
+## テストデータと訓練データに分割
+```{r}
+# split data and down sampling
+set.seed(2)
+nrow_df <- nrow(df)
+test_ind <- sample(nrow_df, 5000)
+train <- df[-test_ind,]
+test <- df[test_ind,]
+
+t_train <- train[train$is_treat==1,]
+c_train <- train[train$is_treat==0,]
+
+table(t_train$is_cv, t_train$is_treat)
+table(c_train$is_cv, c_train$is_treat)
+table(test$is_cv, test$is_treat)
+```
+
+
+# 関数準備
+## lift, base lineを計算する関数を定義
+モデルで計算したスコアと元データのis_treat, is_cvを用いてLiftを計算する
+またBase lineも計算する
+```{r}
+# summarise result
+calc_lift <- function(score, is_treat, is_cv, t_prob=NULL, c_prob=NULL) {
+  if (is.null(t_prob)) t_prob <- rep(NA, length(score))
+  if (is.null(c_prob)) c_prob <- rep(NA, length(score))
+  sdf <- data.frame(score=score, t_prob=t_prob, c_prob=c_prob, is_treat=is_treat, is_cv=is_cv)
+  sdf <- sdf[order(sdf$score, decreasing=T),]
+  sdf$rank <- seq(nrow(sdf))
+  
+  treat_uu <- 0
+  control_uu <- 0
+  treat_cv <- 0
+  control_cv <- 0
+  treat_cvr <- 0.0
+  control_cvr <- 0.0
+  lift <- 0.0
+  sdf <- cbind(sdf, lift=rep(NA, nrow(sdf)))
+  
+  for (i in 1:nrow(sdf)) {
+    trow <- sdf[i,]
+    if (trow$is_treat == 1) {
+        treat_uu <- treat_uu + 1
+        if (trow$is_cv == 1) treat_cv <- treat_cv + 1
+        treat_cvr <- treat_cv / treat_uu
+    } else {
+        control_uu <- control_uu + 1
+        if (trow$is_cv == 1) control_cv <- control_cv + 1
+        control_cvr <- control_cv / control_uu
+    }
+    sdf[i, 'lift'] <- ((treat_cvr - control_cvr) * treat_uu)
+  }
+  
+  base_line <- seq(nrow(sdf)) / nrow(sdf) * sdf$lift[nrow(sdf)]
+  
+  return(list(sdf=sdf, base_line=base_line))
+}
+```
+
+## 10パーセンタイルグラフ用のデータ計算関数
+スコアを10パーセンタイルに区切り、
+パーセンタイルごとに、統制群／実験群ごとのCVRを計算する
+（breaksは右閉区間の区分値なので、rightオプションをF（デフォルトは右開区間）にする）
+```{r}
+# binning score with quantile
+bin_score <- function(sdf) {
+  breaks <- quantile(sdf$score, prob=seq(0, 1, 0.1))
+  labels <- c()
+  for ( i in rev(seq(1,length(breaks)-1))) {
+      labels <- append(labels, paste(names(breaks)[i], '-', names(breaks)[i+1]))
+  }
+  score_bins <- cut(sdf$score, breaks=breaks, labels=labels, right=F, include.lowest=T)
+  sdf$score_bins <- score_bins
+  
+  lbl_list <- c()
+  is_treat_list <- c()
+  cvr_list <- c()
+  for (lbl in labels) {
+    tdf <- sdf[sdf$score_bins==lbl, c('is_treat', 'is_cv')]
+    lbl_list <- append(lbl_list, rep(lbl, 2))
+    is_treat_list <- append(is_treat_list, c('0', '1'))
+    cvr_list <- append(cvr_list,
+                       c(sum(tdf[tdf$is_treat==0, 'is_cv']) / nrow(tdf),
+                         sum(tdf[tdf$is_treat==1, 'is_cv']) / nrow(tdf))
+                       )
+  }
+  bdf <- data.frame(bins=lbl_list, is_treat=is_treat_list, cvr=cvr_list)
+  return(bdf)
+}
+
+
+```
+
+
+# Two Model Approach
+## モデル構築
+ロジスティック回帰を使用
+```{r}
+form <- as.formula(paste("is_cv ~", paste(pred_vars, collapse="+")))
+t_model <- glm(form, data=t_train, family=binomial)
+c_model <- glm(form, data=c_train, family=binomial)
+```
+
+## 介入あり、介入なしのコンバージョン確率を予測
+```{r}
+t_prob <- predict(t_model, test, type='response')
+c_prob <- predict(c_model, test, type='response')
+```
+
+## 結果の計算
+```{r}
+score_tma <- t_prob / c_prob
+
+calc_result <- calc_lift(score_tma, test$is_treat, test$is_cv, t_prob, c_prob)
+sdf_tma <- calc_result$sdf
+base_line <- calc_result$base_line
+
+bdf_tma <- bin_score(sdf_tma)
+```
+
+## 可視化
+```{r}
+library(ggplot2)
+ggplot(data=sdf_tma, aes(x=rank)) + 
+  geom_line(aes(y=lift, color='lift')) + 
+  geom_line(aes(y=base_line, color='base line')) + 
+  theme_light()
+
+ggplot(data=sdf_tma, aes(x=score)) + 
+  geom_line(aes(y=lift, color='lift')) + 
+  geom_line(aes(y=base_line, color='base line')) + 
+  scale_x_reverse() + # limits = c(10, 0)
+  theme_light()
+
+ggplot(bdf_tma, aes(x=bins, y=cvr, fill=is_treat)) +
+  geom_bar(stat = "identity", position = "dodge")
+```
+
+
+# CVT(Class Variable Transformation)
+## control:treat=1:1の確認（ランダム割付の確認だが、データの割合は間接的な確認に過ぎない）
+```{r}
+table(train$is_treat)
+```
+
+
+## z-labelの算出
+${Z_i = \left\{ \begin{array}{ll} 1 & (\, if \, G_i=T \, and \, Y_i=1 \, ) \\ 1 & (\, if \, G_i=C \, and \, Y_i=0 \, ) \\ 0 & otherwise \end{array} \right. }$
+
+z_label = 介入ありの反応ありを1に + 介入なしの反応なしを1に
+```{r}
+z_label <- train$is_cv * train$is_treat + (1 - train$is_cv) * (1 - train$is_treat)
+train_cvt <- cbind(train, z_label)
+```
+
+## モデル構築
+```{r}
+form_cvt <- as.formula(paste("z_label ~", paste(pred_vars, collapse="+")))
+cvt_model <- glm(form_cvt, data=train_cvt, family=binomial)
+```
+
+## 予測とz-scoreの算出
+$TE_i=2P_i(Z_i=1 | X_{i1}...X_{im}) - 1$
+
+```{r}
+prob_cvt <- predict(cvt_model, test, type='response')
+z_score = 2 * prob_cvt - 1
+```
+
+## Liftの計算
+```{r}
+calc_result_cvt <- calc_lift(z_score, test$is_treat, test$is_cv)
+sdf_cvt <- calc_result_cvt$sdf
+```
+
+# SBUT(Significance-Based Uplift Tree)
+
+## モデルの構築
+split_method
+SBUT:"Int"
+DBUT:"ED", "Chisq", "KL"
+```{r}
+# install.packages('uplift')
+library(uplift)
+
+uprf1 <- upliftRF(is_cv ~ marry_dummy + child_dummy + area_kanto + area_tokai + area_keihanshin +
+                    inc + pmoney + TVwatch_day + T + F1 + F2 + F3 + M1 + M2 + M3 + trt(is_treat),
+                 data = train,
+                 ntree = 100,
+                 split_method = "Int",
+                 minsplit = 200,
+                 verbose = TRUE
+                 )
+
+```
+
+## 重要度の確認
+```{r}
+summary(uprf1)
+```
+
+## 予測とスコアの計算
+```{r}
+# when predict.all=F
+# pr.y1_ct1: response rate in treatment
+# pr.y1_ct0: response rate in control
+pred_uprf1 <- predict(uprf1, test)
+head(pred_uprf1)
+t_prob_sbut <- pred_uprf1[,1]
+c_prob_sbut <- pred_uprf1[,2]
+score_sbut <- t_prob_sbut - c_prob_sbut
+```
+
+## リフトの計算
+```{r}
+calc_result_sbut <- calc_lift(score_sbut, test$is_treat, test$is_cv, t_prob_sbut, c_prob_sbut)
+sdf_sbut <- calc_result_sbut$sdf
+```
+
+
+# モデルの比較
+## Uplift Curveのプロット
+```{r}
+ggplot(data=sdf_tma, aes(x=rank)) + 
+  geom_line(aes(y=base_line, color='base line')) + 
+  geom_line(aes(y=lift, color='TMA'), data=sdf_tma) + 
+  geom_line(aes(y=lift, color='CVT'), data=sdf_cvt) +
+  geom_line(aes(y=lift, color='SBUT'), data=sdf_sbut) + 
+  theme_light()
+```
+
+# TOM(Transformed Outcome Method)
+## PS推定/TO算出
+```{r}
+ps_vars <- c("age", "sex", "TVwatch_day", "marry_dummy", "child_dummy", "inc", "pmoney",
+         "area_kanto", "area_tokai", "area_keihanshin",
+         "job_dummy1", "job_dummy2", "job_dummy3", "job_dummy4", "job_dummy5", "job_dummy6",
+         "fam_str_dummy1", "fam_str_dummy2", "fam_str_dummy3", "fam_str_dummy4")
+form_ps <- as.formula(paste("is_treat ~", paste(ps_vars, collapse="+")))
+ps_model <- glm(form_ps, data=train, family=binomial)
+ps <- predict(ps_model, train, type='response')
+
+train$ps <- ps
+train$ps_cv <- ifelse(train$is_cv==1, train$is_cv / train$ps, -1 * train$is_cv / (1 - train$ps))
+```
+
+## スコア算出
+```{r}
+# install.packages('randomForest')
+library(randomForest)
+form_to <- as.formula(paste("ps_cv ~", paste(pred_vars, collapse="+")))
+rf_ps <- randomForest(form_to, data = train)
+```
+
+```{r}
+score_ps <- predict(rf_ps, test)
+calc_result_ps <- calc_lift(score_ps, test$is_treat, test$is_cv)
+sdf_ps <- calc_result_ps$sdf
+```
+
+# SDRM(Switch Doubly Robust Method)
+## SDR算出
+```{r}
+# predict mu
+train$t_prob_mu <- predict(t_model, train, type='response')
+train$c_prob_mu <- predict(c_model, train, type='response')
+
+# calc sdr
+train <- cbind(train, sdr_cv=rep(NA, nrow(train)))
+sdr_gamma <- 0.01
+sw_count <- 0
+for(i in 1:nrow(train)){
+  rc <- train[i,]
+  if(rc$is_treat==1 && sdr_gamma<rc$ps || rc$is_treat==0 && rc$ps<(1-sdr_gamma)){
+    if(rc$is_cv==1){
+      train[i, 'sdr_cv'] <- (rc$is_cv / rc$ps) - rc$t_prob_mu + (rc$t_prob_mu + rc$c_prob_mu)
+    } else {
+      train[i, 'sdr_cv'] <- (-1 * rc$is_cv / (1 - rc$ps)) - rc$c_prob_mu +
+        (rc$t_prob_mu + rc$c_prob_mu)
+    }
+  } else {
+    train[i, 'sdr_cv'] <- rc$t_prob_mu - rc$c_prob_mu
+    sw_count <- sw_count + 1
+  }
+}
+```
+## スコア算出
+```{r}
+form_sdr <- as.formula(paste("sdr_cv ~", paste(pred_vars, collapse="+")))
+rf_sdr <- randomForest(form_sdr, data = train)
+```
+
+```{r}
+score_sdr <- predict(rf_sdr, test)
+calc_result_sdr <- calc_lift(score_sdr, test$is_treat, test$is_cv)
+sdf_sdr <- calc_result_sdr$sdf
+```
+
+# Uplift Curveの描画
+```{r}
+ggplot(data=sdf_tma, aes(x=rank)) + 
+  geom_line(aes(y=base_line, color='base line')) + 
+  geom_line(aes(y=lift, color='TMA'), data=sdf_tma) + 
+#  geom_line(aes(y=lift, color='CVT'), data=sdf_cvt) +
+  geom_line(aes(y=lift, color='SBUT'), data=sdf_sbut) + 
+  geom_line(aes(y=lift, color='TO'), data=sdf_ps) +
+  geom_line(aes(y=lift, color='SDR'), data=sdf_sdr) +
+  theme_light()
+```
+
+# AUUCの算出
+```{r}
+# calculate auuc
+auuc_tma <- sum((sdf_tma$lift - base_line)) / nrow(sdf_tma)
+auuc_cvt <- sum((sdf_cvt$lift - base_line)) / nrow(sdf_cvt)
+auuc_sbut <- sum((sdf_sbut$lift - base_line)) / nrow(sdf_sbut)
+auuc_ps <- sum((sdf_ps$lift - base_line)) / nrow(sdf_ps)
+auuc_sdr <- sum((sdf_sdr$lift - base_line)) / nrow(sdf_sdr)
+paste(auuc_tma, auuc_cvt, auuc_sbut, auuc_ps, auuc_sdr)
+```
+
+# 介入に寄与している説明変数の確認
+算出したスコアを説明変数に回帰することで、どの説明変数が介入効果を押し上げているか確認
+
+## SBUT
+```{r}
+train$score_sbut <- score_sbut
+form_sbut_lm <- as.formula(paste("score_sbut ~", paste(pred_vars, collapse="+")))
+lm_sbut <- lm(form_sbut_lm, train)
+summary(lm_sbut)
+```
+
+
+## SDR
+```{r}
+train$score_sdr <- score_sdr
+form_sdr_lm <- as.formula(paste("score_sdr ~", paste(pred_vars, collapse="+")))
+lm_sdr <- lm(form_sdr_lm, train)
+summary(lm_sdr)
+```
+
